@@ -58,8 +58,13 @@ class SharedBuffer(shared_memory.SharedMemory):
         if cache_size & (cache_size - 1) != 0:
             raise ValueError(f"Cache size is not a power of two")
 
+        self._active_offset = 1
+        self._reader_offset = 1 + num_readers
+        self._writer_offset = 1 + num_readers + (num_readers * 8)
+        self.payload_offset = self._writer_offset + 8
+
         if create:
-            super().__init__(name, create, size + 2 + 2 * num_readers)
+            super().__init__(name, create, size + self.payload_offset)
             self.num_readers = num_readers
             self.is_active = [False] * num_readers
             self.reader_pos = [0] * num_readers
@@ -67,23 +72,32 @@ class SharedBuffer(shared_memory.SharedMemory):
 
             self.buf[0] = num_readers
             for i in range(num_readers):
-                self.buf[1 + i] = 0 # reader active status
-                self.buf[1 + num_readers + i] = 0 # reader pos
-            self.buf[1 + 2 * num_readers] = 0 # writer pos
+                self.buf[self._active_offset + i] = 0
+                r_idx = self._reader_offset + (i * 8)
+                self.buf[r_idx: r_idx + 8] = (0).to_bytes(8, 'little')
+
+            self.buf[self._writer_offset: self._writer_offset + 8] = (0).to_bytes(8, 'little')
         else:
             super().__init__(name, create)
             self.num_readers = self.buf[0]
-            self.is_active = [bool(self.buf[1 + i]) for i in range(self.num_readers)]
-            self.reader_pos = [self.buf[1 + self.num_readers + i] for i in range(self.num_readers)]
-            self.writer_pos = self.buf[1 + 2 * self.num_readers]
+            self.is_active = [bool(self.buf[self._active_offset + i]) for i in
+                              range(self.num_readers)]
+            self.reader_pos = [
+                int.from_bytes(
+                    self.buf[self._reader_offset + (i * 8): self._reader_offset + (i * 8) + 8],
+                    'little')
+                for i in range(self.num_readers)
+            ]
+            self.writer_pos = int.from_bytes(self.buf[self._writer_offset: self._writer_offset + 8],
+                                             'little')
 
         if reader != self._NO_READER and (reader < 0 or reader >= self.num_readers):
             raise ValueError(f"Invalid reader index {reader}, total readers {self.num_readers}")
 
         self.reader = reader
-        self.buf[1 + self.num_readers + self.reader] = self.reader_pos[self.reader] if reader != self._NO_READER else 0
-
-        self.payload_offset = 1 + 2 * self.num_readers + 1
+        if reader != self._NO_READER:
+            r_idx = self._reader_offset + (self.reader * 8)
+            self.buf[r_idx: r_idx + 8] = self.reader_pos[self.reader].to_bytes(8, 'little')
         self.buffer_size = size
 
     def close(self) -> None:
@@ -119,6 +133,13 @@ class SharedBuffer(shared_memory.SharedMemory):
             self.set_reader_active(False)
         self.close()
 
+    def _sync_memory(self):
+        self.is_active = [bool(self.buf[self._active_offset + i]) for i in range(self.num_readers)]
+        self.reader_pos = [
+            int.from_bytes(self.buf[self._reader_offset + (i * 8) : self._reader_offset + (i * 8) + 8], 'little')
+            for i in range(self.num_readers)
+        ]
+
     def calculate_pressure(self) -> int:
         """
         Return current writer pressure as an integer percentage.
@@ -126,8 +147,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         Pressure is based on how much of the bounded storage is currently in use
         relative to the slowest active reader.
         """
-        self.is_active = [bool(self.buf[1 + i]) for i in range(self.num_readers)]
-        self.reader_pos = [self.buf[1 + self.num_readers + i] for i in range(self.num_readers)]
+        self._sync_memory()
         if not any(self.is_active):
             return 0
         min_reader_pos = min([self.reader_pos[i] for i in range(self.num_readers) if self.is_active[i]])
@@ -153,7 +173,8 @@ class SharedBuffer(shared_memory.SharedMemory):
             raise RuntimeError("Writer instance cannot update reader position")
 
         self.reader_pos[self.reader] = new_reader_pos
-        self.buf[1 + self.num_readers + self.reader] = self.reader_pos[self.reader]
+        r_idx = self._reader_offset + (self.reader * 8)
+        self.buf[r_idx: r_idx + 8] = self.reader_pos[self.reader].to_bytes(8, 'little')
 
     def set_reader_active(self, active: bool) -> None:
         """
@@ -166,7 +187,7 @@ class SharedBuffer(shared_memory.SharedMemory):
             raise RuntimeError("Writer instance cannot set reader active")
 
         self.is_active[self.reader] = active
-        self.buf[1 + self.reader] = int(active)
+        self.buf[self._active_offset + self.reader] = int(active)
 
     def is_reader_active(self) -> bool:
         """
@@ -177,7 +198,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         if self.reader == self._NO_READER:
             raise RuntimeError("Writer instance cannot check reader active")
 
-        self.is_active[self.reader] = bool(self.buf[1 + self.reader])
+        self.is_active[self.reader] = bool(self.buf[self._active_offset + self.reader])
         return self.is_active[self.reader]
 
     def update_write_pos(self, new_writer_pos: int) -> None:
@@ -187,7 +208,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         The write position is what makes newly written bytes visible to readers.
         """
         self.writer_pos = new_writer_pos
-        self.buf[1 + 2 * self.num_readers] = self.writer_pos
+        self.buf[self._writer_offset: self._writer_offset + 8] = self.writer_pos.to_bytes(8,
+                                                                                          'little')
 
     def inc_writer_pos(self, inc_amount: int) -> None:
         """
@@ -196,7 +218,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         This is how a writer publishes bytes after copying them into the buffer.
         """
         self.writer_pos += inc_amount
-        self.buf[1 + 2 * self.num_readers] = self.writer_pos
+        self.buf[self._writer_offset: self._writer_offset + 8] = self.writer_pos.to_bytes(8,
+                                                                                          'little')
 
     def inc_reader_pos(self, inc_amount: int) -> None:
         """
@@ -208,7 +231,8 @@ class SharedBuffer(shared_memory.SharedMemory):
             raise RuntimeError("Writer instance cannot advance reader position")
 
         self.reader_pos[self.reader] += inc_amount
-        self.buf[1 + self.num_readers + self.reader] = self.reader_pos[self.reader]
+        r_idx = self._reader_offset + (self.reader * 8)
+        self.buf[r_idx: r_idx + 8] = self.reader_pos[self.reader].to_bytes(8, 'little')
 
     def get_write_pos(self) -> int:
         """
@@ -216,7 +240,7 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         Readers can use this to resynchronize or compute how much data is available.
         """
-        self.writer_pos = self.buf[1 + 2 * self.num_readers]
+        self.writer_pos = int.from_bytes(self.buf[self._writer_offset : self._writer_offset + 8], 'little')
         return self.writer_pos
 
     def compute_max_amount_writable(self, force_rescan: bool = False) -> int:
@@ -227,9 +251,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         by the tests to ensure externally updated reader positions are observed.
         """
         if force_rescan:
-            for i in range(self.num_readers):
-                self.is_active[i] = bool(self.buf[1 + i])
-                self.reader_pos[i] = self.buf[1 + self.num_readers + i]
+            self._sync_memory()
 
         if not any(self.is_active):
             return self.buffer_size
@@ -246,9 +268,11 @@ class SharedBuffer(shared_memory.SharedMemory):
         if self.reader == self._NO_READER:
             raise RuntimeError("Writer instance cannot jump to writer position")
 
-        self.writer_pos = self.buf[1 + 2 * self.num_readers]
+        self.writer_pos = int.from_bytes(self.buf[self._writer_offset: self._writer_offset + 8],
+                                         'little')
         self.reader_pos[self.reader] = self.writer_pos
-        self.buf[1 + self.num_readers + self.reader] = self.reader_pos[self.reader]
+        r_idx = self._reader_offset + (self.reader * 8)
+        self.buf[r_idx: r_idx + 8] = self.reader_pos[self.reader].to_bytes(8, 'little')
 
     def expose_writer_mem_view(self, size: int) -> RingView:
         """
@@ -267,11 +291,12 @@ class SharedBuffer(shared_memory.SharedMemory):
         start = self.payload_offset + self.int_to_pos(self.writer_pos)
 
         if self.int_to_pos(self.writer_pos) + amount > self.buffer_size:
-            mv1 = memoryview(self.buf)[start : self.payload_offset + self.buffer_size]
-            mv2 = memoryview(self.buf)[self.payload_offset : self.payload_offset + (amount - (self.buffer_size - self.int_to_pos(self.writer_pos)))]
+            mv1 = memoryview(self.buf)[start: self.payload_offset + self.buffer_size]
+            mv2 = memoryview(self.buf)[self.payload_offset: self.payload_offset + (
+                        amount - (self.buffer_size - self.int_to_pos(self.writer_pos)))]
             return mv1, mv2, amount, True
         else:
-            return memoryview(self.buf)[start : start + amount], None, amount, False
+            return memoryview(self.buf)[start: start + amount], None, amount, False
 
     def expose_reader_mem_view(self, size: int) -> RingView:
         """
